@@ -60,15 +60,15 @@ jobs:
           }
           exit 0
 
-      - name: Install innoextract + Inno Setup
+      - name: Install Inno Setup
         if: steps.skip.outputs.skip == 'false' || inputs.force
         shell: pwsh
         run: |
-          choco install innoextract innosetup -y --no-progress
+          choco install innosetup -y --no-progress
           $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
           iscc /? | Select-Object -First 1
 
-      - name: Extract upstream installer, swap dll
+      - name: Silent-install upstream client, swap dll
         if: steps.skip.outputs.skip == 'false' || inputs.force
         id: patch
         shell: pwsh
@@ -78,11 +78,19 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force work | Out-Null
           Invoke-WebRequest -Uri "${{ steps.resolve.outputs.setup_url }}" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -OutFile work/setup.exe
-          innoextract -i work/setup.exe | Tee-Object work/innoinfo.txt
-          innoextract -d work/extracted work/setup.exe | Out-Null
-          $approot = (Get-ChildItem work/extracted -Recurse -Filter sakuramedia.exe | Select-Object -First 1).DirectoryName
-          if (-not $approot) { throw "sakuramedia.exe not found after extraction" }
+          # silent install into a pinned dir (innoextract 1.9 cannot read Inno Setup 6.4+ loaders)
+          Start-Process -FilePath work/setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG="work/install.log"','/DIR="C:\patched_app"' -Wait
+          $approot = (Get-ChildItem 'C:\patched_app' -Recurse -Filter sakuramedia.exe | Select-Object -First 1).DirectoryName
+          if (-not $approot) { throw "sakuramedia.exe not found after silent install; check work/install.log" }
+          Get-Content work/install.log -Tail 5
           Write-Host "approot: $approot"
+          # resolve upstream AppId from the uninstall registry (patched setup then upgrades in place)
+          $appId = "SakuraMedia"
+          $keys = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -like '*_is1' } |
+            Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName -like '*SakuraMedia*' }
+          if ($keys) { $appId = ($keys[0].PSChildName -replace '_is1$',''); Write-Host "AppId from registry: $appId" }
+          "app_id=$appId" >> $env:GITHUB_OUTPUT
           gh release download "${{ steps.resolve.outputs.mpv_tag }}" -R "$env:GITHUB_REPOSITORY" -p "libmpv-2.dll" -O work/libmpv-2.dll.new
           $old = Join-Path $approot "libmpv-2.dll"
           Move-Item -Force work/libmpv-2.dll.new $old
@@ -90,6 +98,8 @@ jobs:
           "approot=$approot" >> $env:GITHUB_OUTPUT
           "dll_hash=$h" >> $env:GITHUB_OUTPUT
           Write-Host "swapped libmpv-2.dll ($h)"
+          Get-Process sakuramedia -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 2
 
       - name: Repack installer + portable zip
         if: steps.skip.outputs.skip == 'false' || inputs.force
@@ -98,11 +108,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
           $approot = "${{ steps.patch.outputs.approot }}"
+          $appId = "${{ steps.patch.outputs.app_id }}"
           $ver = "${{ steps.resolve.outputs.client_ver }}"
-          # keep upstream AppId so the patched setup upgrades in place
-          $appId = "SakuraMedia"
-          $m = Get-Content work/innoinfo.txt | Select-String -Pattern 'App(lication )?ID[:=]\s*(.+)' | Select-Object -First 1
-          if ($m) { $appId = ($m.Matches[0].Groups[2].Value).Trim() }
+          # drop the old uninstaller binaries; the new setup regenerates its own
+          Get-ChildItem $approot -Filter "unins*" -ErrorAction SilentlyContinue | Remove-Item -Force
           Write-Host "AppId: $appId"
           $issLines = @(
             "[Setup]",
