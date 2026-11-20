@@ -1,5 +1,12 @@
 # SakuraMedia Windows 客户端 libmpv 补丁
 
+> **两个产物：**
+> 1. **可直接安装的补丁版客户端**（`patch-client.yml`）：自动解包上游 setup.exe →
+>    替换 libmpv-2.dll → 按原 AppId 重打 Inno Setup 安装包 + portable zip，
+>    发布为 `client-<版本>-mpv-<mpv构建>` release，可直接覆盖安装。
+> 2. **单独的 libmpv-2.dll**（`update-libmpv.yml`）：跟踪 mpv-winbuild 构建，
+>    供手动替换或脚本使用。
+
 SakuraMedia Windows 客户端捆绑的 `libmpv-2.dll`（2023-09 media_kit build）无法播放
 **PMT `stream_type=0` 的 MPEG-TS 文件**（常见于流式下载得到的文件，扩展名 .mp4、
 头部带 1×1 PNG stub）：老版 libmpv 不对未声明的基本流做内容探测，会把视频 PID

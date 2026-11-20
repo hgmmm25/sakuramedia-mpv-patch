@@ -1,0 +1,151 @@
+name: Patch Windows client
+
+on:
+  schedule:
+    - cron: "30 2 * * *" # daily 02:30 UTC, after update-libmpv
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild + re-release even if the tag exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream release + our libmpv
+        id: resolve
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $up = gh api repos/tinypinglite/sakuramedia/releases/latest | ConvertFrom-Json
+          $setupAsset = $up.assets | Where-Object { $_.name -match '^sakuramedia-windows-.+-setup.*\.exe$' } | Select-Object -First 1
+          if (-not $setupAsset) { throw "no windows setup asset in upstream $($up.tag_name)" }
+          $librel = gh release view -R "$env:GITHUB_REPOSITORY" --json tagName | ConvertFrom-Json
+          $mpvTag = $librel.tagName
+          $ver = ""
+          if ($setupAsset.name -match '(v[\d.]+)') { $ver = $Matches.1 }
+          $tag = "client-$ver-mpv-$($mpvTag -replace '^libmpv-','')"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "setup_url=$($setupAsset.browser_download_url)" >> $env:GITHUB_OUTPUT
+          "setup_name=$($setupAsset.name)" >> $env:GITHUB_OUTPUT
+          "client_ver=$ver" >> $env:GITHUB_OUTPUT
+          "mpv_tag=$mpvTag" >> $env:GITHUB_OUTPUT
+          Write-Host "upstream $($up.tag_name) asset $($setupAsset.name) -> our tag $tag"
+
+      - name: Skip if already released
+        id: skip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tag = "${{ steps.resolve.outputs.tag }}"
+          gh release view "$tag" -R "$env:GITHUB_REPOSITORY" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Host "$tag already released"
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+          exit 0
+
+      - name: Install innoextract + Inno Setup
+        if: steps.skip.outputs.skip == 'false' || inputs.force
+        shell: pwsh
+        run: |
+          choco install innoextract innosetup -y --no-progress
+          $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
+          iscc /? | Select-Object -First 1
+
+      - name: Extract upstream installer, swap dll
+        if: steps.skip.outputs.skip == 'false' || inputs.force
+        id: patch
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force work | Out-Null
+          Invoke-WebRequest -Uri "${{ steps.resolve.outputs.setup_url }}" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -OutFile work/setup.exe
+          innoextract -i work/setup.exe | Tee-Object work/innoinfo.txt
+          innoextract -d work/extracted work/setup.exe | Out-Null
+          $approot = (Get-ChildItem work/extracted -Recurse -Filter sakuramedia.exe | Select-Object -First 1).DirectoryName
+          if (-not $approot) { throw "sakuramedia.exe not found after extraction" }
+          Write-Host "approot: $approot"
+          gh release download "${{ steps.resolve.outputs.mpv_tag }}" -R "$env:GITHUB_REPOSITORY" -p "libmpv-2.dll" -O work/libmpv-2.dll.new
+          $old = Join-Path $approot "libmpv-2.dll"
+          Move-Item -Force work/libmpv-2.dll.new $old
+          $h = (Get-FileHash $old -Algorithm SHA256).Hash.ToLower()
+          "approot=$approot" >> $env:GITHUB_OUTPUT
+          "dll_hash=$h" >> $env:GITHUB_OUTPUT
+          Write-Host "swapped libmpv-2.dll ($h)"
+
+      - name: Repack installer + portable zip
+        if: steps.skip.outputs.skip == 'false' || inputs.force
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
+          $approot = "${{ steps.patch.outputs.approot }}"
+          $ver = "${{ steps.resolve.outputs.client_ver }}"
+          # keep upstream AppId so the patched setup upgrades in place
+          $appId = "SakuraMedia"
+          $m = Get-Content work/innoinfo.txt | Select-String -Pattern 'App(lication )?ID[:=]\s*(.+)' | Select-Object -First 1
+          if ($m) { $appId = ($m.Matches[0].Groups[2].Value).Trim() }
+          Write-Host "AppId: $appId"
+          $issLines = @(
+            "[Setup]",
+            "AppId=$appId",
+            "AppName=SakuraMedia",
+            "AppVersion=$ver",
+            "DefaultDirName={autopf}\SakuraMedia",
+            "DefaultGroupName=SakuraMedia",
+            "UninstallDisplayIcon={app}\sakuramedia.exe",
+            "Compression=lzma2/max",
+            "SolidCompression=yes",
+            "OutputDir=work\output",
+            "OutputBaseFilename=sakuramedia-windows-$ver-mpvpatch-setup",
+            "",
+            "[Files]",
+            ('Source: "{0}\*"; DestDir: "{{app}}"; Flags: recursesubdirs createallsubdirs ignoreversion' -f $approot),
+            "",
+            "[Icons]",
+            'Name: "{group}\SakuraMedia"; Filename: "{app}\sakuramedia.exe"'
+          )
+          Set-Content -Path work/patched.iss -Value $issLines -Encoding UTF8
+          iscc work/patched.iss
+          $setupOut = Get-ChildItem work/output -Filter *.exe | Select-Object -First 1
+          if (-not $setupOut) { throw "iscc produced no exe" }
+          Compress-Archive -Path "$approot/*" -DestinationPath "work/output/sakuramedia-windows-$ver-mpvpatch-portable.zip" -Force
+          $files = Get-ChildItem work/output -File
+          $files | ForEach-Object { "{0}  {1}" -f ((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()), $_.Name } |
+            Out-File -Encoding ascii work/output/SHA256SUMS.txt
+
+      - name: Create release
+        if: steps.skip.outputs.skip == 'false' || inputs.force
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.resolve.outputs.tag }}"
+          gh release delete "$tag" -R "$env:GITHUB_REPOSITORY" -y --cleanup-tag 2>$null
+          $lines = @(
+            "Patched SakuraMedia Windows client ${{ steps.resolve.outputs.client_ver }}",
+            "libmpv-2.dll replaced with ${{ steps.resolve.outputs.mpv_tag }} (fixes MPEG-TS playback, see upstream issue #85)",
+            "",
+            "SHA256:",
+            (Get-Content work/output/SHA256SUMS.txt | Out-String).TrimEnd()
+          )
+          Set-Content -Path work/body.md -Value $lines -Encoding UTF8
+          gh release create "$tag" -R "$env:GITHUB_REPOSITORY" --title "$tag" --notes-file work/body.md (Get-ChildItem work/output -File).FullName
