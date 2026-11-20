@@ -1,0 +1,89 @@
+name: Update libmpv-2.dll
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # daily 02:00 UTC = 10:00 Taipei
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild + re-release even if the tag exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve latest zhongfly/mpv-winbuild mpv-dev asset
+        id: resolve
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $j = gh api repos/zhongfly/mpv-winbuild/releases/latest | ConvertFrom-Json
+          $asset = $j.assets |
+            Where-Object { $_.name -match '^mpv-dev-x86_64-\d{4}-\d{2}-\d{2}-git-(?<hash>[0-9a-f]+)\.7z$' -and $_.name -notmatch 'v3' } |
+            Select-Object -First 1
+          if (-not $asset) { throw "no matching mpv-dev asset in $($j.tag_name)" }
+          $hash = $Matches.hash
+          "tag=libmpv-$hash" >> $env:GITHUB_OUTPUT
+          "asset_url=$($asset.browser_download_url)" >> $env:GITHUB_OUTPUT
+          "asset_name=$($asset.name)" >> $env:GITHUB_OUTPUT
+          "source_tag=$($j.tag_name)" >> $env:GITHUB_OUTPUT
+          Write-Host "resolved $($asset.name)"
+
+      - name: Skip if already released
+        id: skip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.resolve.outputs.tag }}"
+          gh release view "$tag" -R "$env:GITHUB_REPOSITORY" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Host "$tag already released"
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Download, extract, smoke test
+        if: steps.skip.outputs.skip == 'false'
+        id: build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force work | Out-Null
+          Invoke-WebRequest -Uri "${{ steps.resolve.outputs.asset_url }}" -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } -OutFile work/mpv-dev.7z
+          7z x -y -owork/mpv-dev work/mpv-dev.7z | Out-Null
+          $dll = "work/mpv-dev/libmpv-2.dll"
+          if (-not (Test-Path $dll)) { throw "libmpv-2.dll not found in archive" }
+          python scripts/smoke.py $dll
+          $h = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          "$h  libmpv-2.dll" | Out-File -Encoding ascii work/SHA256SUMS.txt
+          "dll_hash=$h" >> $env:GITHUB_OUTPUT
+
+      - name: Create release
+        if: steps.skip.outputs.skip == 'false' || inputs.force
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.resolve.outputs.tag }}"
+          gh release delete "$tag" -R "$env:GITHUB_REPOSITORY" -y --cleanup-tag 2>$null
+          $lines = @(
+            "libmpv-2.dll extracted from zhongfly/mpv-winbuild ${{ steps.resolve.outputs.source_tag }}",
+            "asset: ${{ steps.resolve.outputs.asset_name }}",
+            "",
+            "SHA256: ${{ steps.build.outputs.dll_hash }}",
+            "",
+            "用途：替换 SakuraMedia Windows 客户端捆绑的 2023-09 libmpv-2.dll（老 build 把 PMT stream_type=0 的 MPEG-TS 视频 PID 误判为 MP3 音频轨，导致内部播放器无法播放此类文件）。用法见 README。"
+          )
+          Set-Content -Path work/body.md -Value $lines -Encoding UTF8
+          gh release create "$tag" -R "$env:GITHUB_REPOSITORY" --title "$tag" --notes-file work/body.md work/mpv-dev/libmpv-2.dll work/SHA256SUMS.txt
