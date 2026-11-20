@@ -125,7 +125,7 @@ jobs:
             "UninstallDisplayIcon={app}\sakuramedia.exe",
             "Compression=lzma2/max",
             "SolidCompression=yes",
-            "OutputDir=work\output",
+            "OutputDir=$pwd\work\output",
             "OutputBaseFilename=sakuramedia-windows-$ver-mpvpatch-setup",
             "",
             "[Files]",
