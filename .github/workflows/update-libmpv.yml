@@ -27,7 +27,7 @@ jobs:
         run: |
           $j = gh api repos/zhongfly/mpv-winbuild/releases/latest | ConvertFrom-Json
           $asset = $j.assets |
-            Where-Object { $_.name -match '^mpv-dev-x86_64-\d{4}-\d{2}-\d{2}-git-(?<hash>[0-9a-f]+)\.7z$' -and $_.name -notmatch 'v3' } |
+            Where-Object { $_.name -match '^mpv-dev-x86_64-(?<date>\d{8})-git-(?<hash>[0-9a-f]+)\.7z$' -and $_.name -notmatch 'v3' } |
             Select-Object -First 1
           if (-not $asset) { throw "no matching mpv-dev asset in $($j.tag_name)" }
           $hash = $Matches.hash
