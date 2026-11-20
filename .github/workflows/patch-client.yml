@@ -113,9 +113,11 @@ jobs:
           # drop the old uninstaller binaries; the new setup regenerates its own
           Get-ChildItem $approot -Filter "unins*" -ErrorAction SilentlyContinue | Remove-Item -Force
           Write-Host "AppId: $appId"
+          # Inno treats a leading { as a constant reference — escape it ({{ -> literal {)
+          $appIdIss = $appId -replace '\{', '{{'
           $issLines = @(
             "[Setup]",
-            "AppId=$appId",
+            "AppId=$appIdIss",
             "AppName=SakuraMedia",
             "AppVersion=$ver",
             "DefaultDirName={autopf}\SakuraMedia",
